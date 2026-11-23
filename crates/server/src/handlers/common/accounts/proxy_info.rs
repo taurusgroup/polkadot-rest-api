@@ -73,22 +73,6 @@ pub struct DecodedProxyDefinition {
     pub delay: String,
 }
 
-/// Map proxy type variant index to common names
-/// These are the common proxy types across Polkadot/Kusama runtimes
-fn proxy_type_name(index: u8) -> String {
-    match index {
-        0 => "Any".to_string(),
-        1 => "NonTransfer".to_string(),
-        2 => "Governance".to_string(),
-        3 => "Staking".to_string(),
-        4 => "IdentityJudgement".to_string(),
-        5 => "CancelProxy".to_string(),
-        6 => "Auction".to_string(),
-        7 => "NominationPools".to_string(),
-        _ => format!("Unknown({})", index),
-    }
-}
-
 // ================================================================================================
 // Core Query Function
 // ================================================================================================
@@ -126,7 +110,7 @@ pub async fn query_proxy_info(
             .into_iter()
             .map(|p| DecodedProxyDefinition {
                 delegate: p.delegate,
-                proxy_type: proxy_type_name(p.proxy_type),
+                proxy_type: p.proxy_type,
                 delay: p.delay.to_string(),
             })
             .collect();
