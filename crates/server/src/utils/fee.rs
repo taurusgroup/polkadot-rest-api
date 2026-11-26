@@ -124,8 +124,8 @@ pub fn dispatch_class_from_u8(class: u8) -> String {
 
 /// Decode RuntimeDispatchInfo from SCALE-encoded bytes.
 ///
-/// This handles both legacy (V1 weight - single u64) and modern (V2 weight - ref_time + proof_size)
-/// formats automatically based on the byte length and content.
+/// Handles a V2 weight (ref_time + proof_size) with a u128 or u64 `Balance`, and the legacy V1
+/// weight (single u64) with a u128 `Balance`. Every layout must consume the input exactly.
 ///
 /// # Arguments
 /// * `result_bytes` - The SCALE-encoded RuntimeDispatchInfo bytes from the runtime API response
@@ -134,41 +134,39 @@ pub fn dispatch_class_from_u8(class: u8) -> String {
 /// * `Some(RuntimeDispatchInfoRaw)` if decoding succeeds
 /// * `None` if the bytes cannot be decoded as a valid RuntimeDispatchInfo
 pub fn decode_runtime_dispatch_info(result_bytes: &[u8]) -> Option<RuntimeDispatchInfoRaw> {
-    use parity_scale_codec::{Compact, Decode};
+    use parity_scale_codec::{Compact, DecodeAll};
 
-    // Try to decode as legacy RuntimeDispatchInfo (with V1 weight) FIRST
-    // Format: { weight: u64, class: u8, partial_fee: u128 } = exactly 25 bytes
-    // V1 is tried first because it has a fixed size and validates cleanly.
-    // The V2 Compact decoder is too permissive and will "succeed" with garbage on V1 data.
-    if result_bytes.len() == 25
-        && let Ok((weight, class, partial_fee)) = <(u64, u8, u128)>::decode(&mut &result_bytes[..])
-        && class <= 2
-    {
-        return Some(RuntimeDispatchInfoRaw {
-            weight: WeightRaw::V1(weight),
-            class: dispatch_class_from_u8(class),
-            partial_fee,
-        });
-    }
-
-    // Try to decode as modern RuntimeDispatchInfo (with V2 weight)
-    // Format: { weight: { ref_time: Compact<u64>, proof_size: Compact<u64> }, class: u8, partial_fee: u128 }
-    if let Ok((ref_time, proof_size, class, partial_fee)) =
-        <(Compact<u64>, Compact<u64>, u8, u128)>::decode(&mut &result_bytes[..])
-        && class <= 2
-    {
-        return Some(RuntimeDispatchInfoRaw {
+    let v2 = |ref_time: Compact<u64>, proof_size: Compact<u64>, class: u8, partial_fee: u128| {
+        RuntimeDispatchInfoRaw {
             weight: WeightRaw::V2 {
                 ref_time: ref_time.0,
                 proof_size: proof_size.0,
             },
             class: dispatch_class_from_u8(class),
             partial_fee,
-        });
+        }
+    };
+
+    // V2 before V1: a V2 payload is 25 bytes, like V1, whenever its two compact weights take
+    // 8 bytes together, while a V1 weight only reads as two exact compacts from 2^48 upwards.
+    // Format: { weight: { ref_time: Compact<u64>, proof_size: Compact<u64> }, class: u8, partial_fee: u128 }
+    if let Ok((ref_time, proof_size, class, partial_fee)) =
+        <(Compact<u64>, Compact<u64>, u8, u128)>::decode_all(&mut &result_bytes[..])
+        && class <= 2
+    {
+        return Some(v2(ref_time, proof_size, class, partial_fee));
     }
 
-    // If V2 failed validation, try V1 without length check as fallback
-    if let Ok((weight, class, partial_fee)) = <(u64, u8, u128)>::decode(&mut &result_bytes[..])
+    // Same V2 weight with a u64 `Balance` (e.g. Bittensor): partial_fee takes 8 bytes.
+    if let Ok((ref_time, proof_size, class, partial_fee)) =
+        <(Compact<u64>, Compact<u64>, u8, u64)>::decode_all(&mut &result_bytes[..])
+        && class <= 2
+    {
+        return Some(v2(ref_time, proof_size, class, partial_fee.into()));
+    }
+
+    // Legacy V1 weight. Format: { weight: u64, class: u8, partial_fee: u128 } = exactly 25 bytes
+    if let Ok((weight, class, partial_fee)) = <(u64, u8, u128)>::decode_all(&mut &result_bytes[..])
         && class <= 2
     {
         return Some(RuntimeDispatchInfoRaw {
@@ -751,5 +749,117 @@ mod tests {
         let fee = calculate_accurate_fee(&fee_details, "500", "1000").unwrap();
         // 100 + 50 + (1000 * 500/1000) = 100 + 50 + 500 = 650
         assert_eq!(fee, "650");
+    }
+
+    /// `TransactionPaymentApi_query_info` result read from Bittensor mainnet (spec 491), where
+    /// `Balance` is u64: 15 bytes, against 23 for the same weight with a u128 partial fee.
+    #[test]
+    fn test_decode_runtime_dispatch_info_u64_balance() {
+        let bytes = hex::decode("0278e768edc4000000000000000000").unwrap();
+
+        let info = decode_runtime_dispatch_info(&bytes).expect("should decode a u64 partial fee");
+        assert!(matches!(
+            info.weight,
+            WeightRaw::V2 {
+                ref_time: 440_000_000,
+                proof_size: 12_603
+            }
+        ));
+        assert_eq!(info.class, "Normal");
+        assert_eq!(info.partial_fee, 0);
+    }
+
+    #[test]
+    fn test_decode_runtime_dispatch_info_u64_balance_with_fee() {
+        use parity_scale_codec::{Compact, Encode};
+
+        let bytes = (
+            Compact(92_867_688_000u64),
+            Compact(15_206u64),
+            0u8,
+            648_114u64,
+        )
+            .encode();
+
+        let info = decode_runtime_dispatch_info(&bytes).expect("should decode a u64 partial fee");
+        assert!(matches!(
+            info.weight,
+            WeightRaw::V2 {
+                ref_time: 92_867_688_000,
+                proof_size: 15_206
+            }
+        ));
+        assert_eq!(info.partial_fee, 648_114);
+    }
+
+    #[test]
+    fn test_decode_runtime_dispatch_info_u128_balance_unchanged() {
+        use parity_scale_codec::{Compact, Encode};
+
+        let bytes = (
+            Compact(440_000_000u64),
+            Compact(12_603u64),
+            1u8,
+            648_114u128,
+        )
+            .encode();
+        assert_eq!(bytes.len(), 23);
+
+        let info = decode_runtime_dispatch_info(&bytes).expect("should decode a u128 partial fee");
+        assert!(matches!(
+            info.weight,
+            WeightRaw::V2 {
+                ref_time: 440_000_000,
+                proof_size: 12_603
+            }
+        ));
+        assert_eq!(info.class, "Operational");
+        assert_eq!(info.partial_fee, 648_114);
+    }
+
+    /// A V2 weight whose compacts take 8 bytes makes a 25-byte payload, the size of the V1 layout.
+    #[test]
+    fn test_decode_runtime_dispatch_info_v2_of_v1_size() {
+        use parity_scale_codec::{Compact, Encode};
+
+        let bytes = (
+            Compact(92_867_688_000u64),
+            Compact(15_206u64),
+            0u8,
+            648_114u128,
+        )
+            .encode();
+        assert_eq!(bytes.len(), 25);
+
+        let info = decode_runtime_dispatch_info(&bytes).expect("should decode");
+        assert!(matches!(
+            info.weight,
+            WeightRaw::V2 {
+                ref_time: 92_867_688_000,
+                proof_size: 15_206
+            }
+        ));
+        assert_eq!(info.partial_fee, 648_114);
+    }
+
+    #[test]
+    fn test_decode_runtime_dispatch_info_v1_weight() {
+        use parity_scale_codec::Encode;
+
+        let bytes = (200_000_000u64, 1u8, 648_114u128).encode();
+        assert_eq!(bytes.len(), 25);
+
+        let info = decode_runtime_dispatch_info(&bytes).expect("should decode");
+        assert!(matches!(info.weight, WeightRaw::V1(200_000_000)));
+        assert_eq!(info.class, "Operational");
+        assert_eq!(info.partial_fee, 648_114);
+    }
+
+    #[test]
+    fn test_decode_runtime_dispatch_info_u64_balance_rejects_trailing_bytes() {
+        let mut bytes = hex::decode("0278e768edc4000000000000000000").unwrap();
+        bytes.push(0);
+
+        assert!(decode_runtime_dispatch_info(&bytes).is_none());
     }
 }

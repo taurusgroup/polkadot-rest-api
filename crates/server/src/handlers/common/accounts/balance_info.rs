@@ -58,7 +58,7 @@ pub enum BalanceQueryError {
     #[error("Failed to decode storage value: {0}")]
     DecodeFailed(#[from] parity_scale_codec::Error),
 
-    /// `System::Account` bytes matched no layout we understand. Separate from [`Self::DecodeFailed`]
+    /// `System::Account` bytes decoded neither with the chain metadata nor as a known fixed layout. Separate from [`Self::DecodeFailed`]
     /// because that wraps `parity_scale_codec::Error`, which only converts from `&'static str` —
     /// a `format!`-built string carrying the byte count cannot go through it.
     #[error(

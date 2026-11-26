@@ -7,6 +7,7 @@
 //! including System::Account, Balances::Locks, Proxy::Proxies, and Vesting::Vesting.
 
 use parity_scale_codec::Decode;
+use scale_value::{At, Composite, Value, ValueDef};
 use sp_core::crypto::AccountId32;
 use subxt::{OnlineClientAtBlock, SubstrateConfig};
 
@@ -77,7 +78,7 @@ struct AccountInfoRefcount {
 }
 
 /// Balance lock structure
-#[derive(Debug, Clone, Decode)]
+#[derive(Debug, Clone, Decode, scale_decode::DecodeAsType)]
 struct BalanceLock {
     id: [u8; 8],
     amount: u128,
@@ -85,7 +86,7 @@ struct BalanceLock {
 }
 
 /// Lock reasons enum
-#[derive(Debug, Clone, Decode)]
+#[derive(Debug, Clone, Decode, scale_decode::DecodeAsType)]
 enum Reasons {
     Fee,
     Misc,
@@ -107,6 +108,15 @@ impl Reasons {
 struct ProxyDefinition {
     delegate: [u8; 32],
     proxy_type: u8,
+    delay: u32,
+}
+
+/// Proxy storage value read with the chain metadata: any deposit width, and the proxy type as the
+/// runtime names it.
+#[derive(scale_decode::DecodeAsType)]
+struct ProxyDefinitionNamed {
+    delegate: [u8; 32],
+    proxy_type: Value,
     delay: u32,
 }
 
@@ -145,7 +155,7 @@ pub struct DecodedBalanceLock {
 #[derive(Debug, Clone)]
 pub struct DecodedProxyDefinition {
     pub delegate: String,
-    pub proxy_type: u8,
+    pub proxy_type: String,
     pub delay: u32,
 }
 
@@ -195,21 +205,43 @@ async fn try_fetch_storage(
 /// Read and decode an account's `System::Account` entry.
 ///
 /// `Ok(Some)` if present and decoded, `Ok(None)` if genuinely absent, `Err(Fetch)` on a fetch
-/// failure, `Err(Decode)` if the bytes matched no known layout.
+/// failure, `Err(Decode)` if the bytes could be decoded neither with the chain metadata nor as a
+/// known fixed layout.
 pub async fn get_account_data(
     client_at_block: &OnlineClientAtBlock<SubstrateConfig>,
     account: &AccountId32,
 ) -> Result<Option<DecodedAccountData>, AccountDataError> {
-    let Some(raw_bytes) = try_fetch_storage(client_at_block, "System", "Account", account).await?
+    let storage_addr = subxt::dynamic::storage::<_, ()>("System", "Account");
+    let account_bytes: [u8; 32] = *account.as_ref();
+
+    let Some(value) = client_at_block
+        .storage()
+        .try_fetch(storage_addr, (account_bytes,))
+        .await?
     else {
         return Ok(None);
     };
 
-    // Bytes present but undecodable is an error, not an absent account.
-    match decode_account_info(&raw_bytes) {
-        Some(data) => Ok(Some(data)),
-        None => Err(AccountDataError::Decode(raw_bytes.len())),
+    // Metadata first: the byte length alone cannot tell `frozen`/`flags` from
+    // `misc_frozen`/`fee_frozen` (both 80 bytes), nor a u128 `Balance` from another balance type
+    // (u64 on Bittensor).
+    if let Some(data) = value
+        .decode_as::<Value>()
+        .ok()
+        .as_ref()
+        .and_then(account_data_from_value)
+    {
+        return Ok(Some(data));
     }
+
+    // Fixed layouts, for blocks whose metadata does not describe `AccountInfo` by these names.
+    if let Some(data) = decode_account_info(value.bytes()) {
+        return Ok(Some(data));
+    }
+
+    // Bytes present but undecodable is an error, not an absent account.
+    warn_undecodable("AccountInfo", value.bytes());
+    Err(AccountDataError::Decode(value.bytes().len()))
 }
 
 /// Like [`get_account_data`], but returns zeroed balances for a genuinely-absent account.
@@ -235,12 +267,29 @@ pub async fn get_balance_locks(
     client_at_block: &OnlineClientAtBlock<SubstrateConfig>,
     account: &AccountId32,
 ) -> Result<Vec<DecodedBalanceLock>, subxt::error::StorageError> {
-    let Some(raw_bytes) = try_fetch_storage(client_at_block, "Balances", "Locks", account).await?
+    let storage_addr = subxt::dynamic::storage::<_, ()>("Balances", "Locks");
+    let account_bytes: [u8; 32] = *account.as_ref();
+
+    let Some(value) = client_at_block
+        .storage()
+        .try_fetch(storage_addr, (account_bytes,))
+        .await?
     else {
         return Ok(Vec::new());
     };
 
-    Ok(decode_balance_locks(&raw_bytes).unwrap_or_default())
+    if let Some(locks) = decode_balance_locks(value.bytes()) {
+        return Ok(locks);
+    }
+
+    // The fixed layout assumes a u128 `Balance`. Without this, a chain with another balance type
+    // would report an account's locks as an empty list.
+    if let Ok(locks) = value.decode_as::<Vec<BalanceLock>>() {
+        return Ok(into_decoded_locks(locks));
+    }
+
+    warn_undecodable("Balances::Locks", value.bytes());
+    Ok(Vec::new())
 }
 
 /// Get proxy definitions from `Proxy::Proxies` (`None` when absent; `Err` on fetch failure).
@@ -249,12 +298,44 @@ pub async fn get_proxy_definitions(
     account: &AccountId32,
     ss58_prefix: u16,
 ) -> Result<Option<(Vec<DecodedProxyDefinition>, u128)>, subxt::error::StorageError> {
-    let Some(raw_bytes) = try_fetch_storage(client_at_block, "Proxy", "Proxies", account).await?
+    use sp_core::crypto::Ss58Codec;
+
+    let storage_addr = subxt::dynamic::storage::<_, ()>("Proxy", "Proxies");
+    let account_bytes: [u8; 32] = *account.as_ref();
+
+    let Some(value) = client_at_block
+        .storage()
+        .try_fetch(storage_addr, (account_bytes,))
+        .await?
     else {
         return Ok(None);
     };
 
-    Ok(decode_proxy_definitions(&raw_bytes, ss58_prefix))
+    // Metadata first: the proxy types are the runtime's own enum, and the deposit has the width of
+    // the chain's `Balance`.
+    if let Ok((proxies, deposit)) = value.decode_as::<(Vec<ProxyDefinitionNamed>, u128)>()
+        && let Some(proxies) = proxies
+            .into_iter()
+            .map(|p| {
+                Some(DecodedProxyDefinition {
+                    delegate: AccountId32::from(p.delegate)
+                        .to_ss58check_with_version(ss58_prefix.into()),
+                    proxy_type: variant_name(&p.proxy_type)?,
+                    delay: p.delay,
+                })
+            })
+            .collect::<Option<Vec<_>>>()
+    {
+        return Ok(Some((proxies, deposit)));
+    }
+
+    // Fixed layout, for blocks whose metadata does not describe the entry this way.
+    if let Some(decoded) = decode_proxy_definitions(value.bytes(), ss58_prefix) {
+        return Ok(Some(decoded));
+    }
+
+    warn_undecodable("Proxy::Proxies", value.bytes());
+    Ok(None)
 }
 
 /// Get vesting schedules from `Vesting::Vesting` (empty when absent; `Err` on fetch failure).
@@ -276,7 +357,7 @@ pub async fn get_vesting_schedules(
 
 /// Log storage bytes we fetched but could not decode: byte length plus the first 32 bytes as hex.
 ///
-/// Every caller below returns `None` on an unrecognized layout, and for locks, proxies and vesting
+/// An unrecognized layout yields `None`, and for locks, proxies and vesting
 /// that degrades to an empty field with HTTP 200 rather than failing the request. This log line is
 /// therefore the only signal that a runtime upgrade changed a layout we thought we understood.
 fn warn_undecodable(what: &str, raw_bytes: &[u8]) {
@@ -353,31 +434,68 @@ fn decode_account_info(raw_bytes: &[u8]) -> Option<DecodedAccountData> {
 
     // No fallback: we only decode sizes we explicitly understand (69, 76, 80).
     // SCALE Decode will happily consume a prefix of a larger buffer, which would silently
-    // return wrong data for future runtime layouts with a different size. If we encounter
-    // an unknown size, log it and return None so the caller can handle it gracefully.
-    warn_undecodable("AccountInfo", raw_bytes);
+    // return wrong data for future runtime layouts with a different size.
     None
 }
 
-fn decode_balance_locks(raw_bytes: &[u8]) -> Option<Vec<DecodedBalanceLock>> {
-    let Ok(locks) = Vec::<BalanceLock>::decode(&mut &raw_bytes[..]) else {
-        warn_undecodable("Balances::Locks", raw_bytes);
-        return None;
-    };
+/// Build the account data from an `AccountInfo` decoded with the chain metadata.
+///
+/// Fields are read by name, so this does not depend on the width of the balance type or on the
+/// reference counters the runtime has. `None` if a field this API reports is missing.
+fn account_data_from_value<T>(info: &Value<T>) -> Option<DecodedAccountData> {
+    let nonce = u32::try_from(uint_at(info, "nonce")?).ok()?;
+    let data = info.at("data")?;
+    let free = uint_at(data, "free")?;
+    let reserved = uint_at(data, "reserved")?;
 
-    Some(
-        locks
-            .into_iter()
-            .map(|lock| {
-                let id = format!("0x{}", hex::encode(lock.id));
-                DecodedBalanceLock {
-                    id,
-                    amount: lock.amount,
-                    reasons: lock.reasons.as_str().to_string(),
-                }
-            })
-            .collect(),
-    )
+    if let Some(frozen) = uint_at(data, "frozen") {
+        return Some(DecodedAccountData {
+            nonce,
+            free,
+            reserved,
+            misc_frozen: None,
+            fee_frozen: None,
+            frozen: Some(frozen),
+        });
+    }
+
+    Some(DecodedAccountData {
+        nonce,
+        free,
+        reserved,
+        misc_frozen: Some(uint_at(data, "misc_frozen")?),
+        fee_frozen: Some(uint_at(data, "fee_frozen")?),
+        frozen: None,
+    })
+}
+
+fn uint_at<T>(value: &Value<T>, field: &str) -> Option<u128> {
+    as_uint(value.at(field)?)
+}
+
+/// Read an unsigned integer, looking through newtype wrappers such as `struct Balance(u64)`.
+fn as_uint<T>(value: &Value<T>) -> Option<u128> {
+    match &value.value {
+        ValueDef::Composite(Composite::Unnamed(fields)) if fields.len() == 1 => as_uint(&fields[0]),
+        _ => value.as_u128(),
+    }
+}
+
+fn decode_balance_locks(raw_bytes: &[u8]) -> Option<Vec<DecodedBalanceLock>> {
+    Vec::<BalanceLock>::decode(&mut &raw_bytes[..])
+        .ok()
+        .map(into_decoded_locks)
+}
+
+fn into_decoded_locks(locks: Vec<BalanceLock>) -> Vec<DecodedBalanceLock> {
+    locks
+        .into_iter()
+        .map(|lock| DecodedBalanceLock {
+            id: format!("0x{}", hex::encode(lock.id)),
+            amount: lock.amount,
+            reasons: lock.reasons.as_str().to_string(),
+        })
+        .collect()
 }
 
 fn decode_proxy_definitions(
@@ -388,10 +506,7 @@ fn decode_proxy_definitions(
 
     // Proxy storage is (Vec<ProxyDefinition>, deposit)
     // Try decoding the tuple
-    let Ok((proxies, deposit)) = <(Vec<ProxyDefinition>, u128)>::decode(&mut &raw_bytes[..]) else {
-        warn_undecodable("Proxy::Proxies", raw_bytes);
-        return None;
-    };
+    let (proxies, deposit) = <(Vec<ProxyDefinition>, u128)>::decode(&mut &raw_bytes[..]).ok()?;
 
     let decoded_proxies = proxies
         .into_iter()
@@ -400,13 +515,37 @@ fn decode_proxy_definitions(
                 AccountId32::from(p.delegate).to_ss58check_with_version(ss58_prefix.into());
             DecodedProxyDefinition {
                 delegate,
-                proxy_type: p.proxy_type,
+                proxy_type: proxy_type_name(p.proxy_type),
                 delay: p.delay,
             }
         })
         .collect();
 
     Some((decoded_proxies, deposit))
+}
+
+/// Name of a fieldless enum variant, such as a proxy type.
+fn variant_name<T>(value: &Value<T>) -> Option<String> {
+    match &value.value {
+        ValueDef::Variant(variant) => Some(variant.name.clone()),
+        _ => None,
+    }
+}
+
+/// Proxy type names by variant index on Polkadot/Kusama runtimes, for when the metadata cannot
+/// name them.
+fn proxy_type_name(index: u8) -> String {
+    match index {
+        0 => "Any".to_string(),
+        1 => "NonTransfer".to_string(),
+        2 => "Governance".to_string(),
+        3 => "Staking".to_string(),
+        4 => "IdentityJudgement".to_string(),
+        5 => "CancelProxy".to_string(),
+        6 => "Auction".to_string(),
+        7 => "NominationPools".to_string(),
+        _ => format!("Unknown({})", index),
+    }
 }
 
 fn decode_vesting_schedules(raw_bytes: &[u8]) -> Option<Vec<DecodedVestingInfo>> {
@@ -600,6 +739,277 @@ mod tests {
         assert_eq!(build_modern_bytes(0, 0, 0, 0).len(), 80);
         assert_eq!(build_pre_sufficients_bytes(0, 0, 0, 0, 0).len(), 76);
         assert_eq!(build_refcount_bytes(0, 0, 0, 0, 0, 0).len(), 69);
+    }
+}
+
+/// Tests for the metadata-driven `AccountInfo` and `Balances::Locks` decoding.
+#[cfg(test)]
+mod metadata_decode_tests {
+    use super::*;
+    use parity_scale_codec::Encode;
+    use scale_info::PortableRegistry;
+
+    /// `AccountInfo` of a chain whose `Balance` is u64, as on Bittensor.
+    #[derive(Encode, scale_info::TypeInfo)]
+    struct AccountInfoU64 {
+        nonce: u32,
+        consumers: u32,
+        providers: u32,
+        sufficients: u32,
+        data: AccountDataU64,
+    }
+
+    #[derive(Encode, scale_info::TypeInfo)]
+    struct AccountDataU64 {
+        free: u64,
+        reserved: u64,
+        frozen: u64,
+        flags: u128,
+    }
+
+    /// Same, with the balance wrapped in a newtype.
+    #[derive(Encode, scale_info::TypeInfo)]
+    struct WrappedBalance(u64);
+
+    #[derive(Encode, scale_info::TypeInfo)]
+    struct AccountInfoWrapped {
+        nonce: u32,
+        data: AccountDataWrapped,
+    }
+
+    #[derive(Encode, scale_info::TypeInfo)]
+    struct AccountDataWrapped {
+        free: WrappedBalance,
+        reserved: WrappedBalance,
+        frozen: WrappedBalance,
+    }
+
+    /// Pre-`frozen` runtime with a u64 `Balance`.
+    #[derive(Encode, scale_info::TypeInfo)]
+    struct AccountInfoLegacyU64 {
+        nonce: u32,
+        data: AccountDataLegacyU64,
+    }
+
+    #[derive(Encode, scale_info::TypeInfo)]
+    struct AccountDataLegacyU64 {
+        free: u64,
+        reserved: u64,
+        misc_frozen: u64,
+        fee_frozen: u64,
+    }
+
+    /// Decode `value` the way `get_account_data` does: against the type's own metadata.
+    fn decode_with_metadata<T: Encode + scale_info::TypeInfo + 'static>(
+        value: &T,
+    ) -> Option<DecodedAccountData> {
+        let mut registry = scale_info::Registry::new();
+        let type_id = registry.register_type(&scale_info::meta_type::<T>()).id;
+        let registry: PortableRegistry = registry.into();
+
+        let bytes = value.encode();
+        let decoded = scale_value::scale::decode_as_type(&mut &bytes[..], type_id, &registry)
+            .expect("bytes should decode against their own type");
+        account_data_from_value(&decoded)
+    }
+
+    /// An account read from Bittensor mainnet (spec 491): nonce 1981, free 75057346.
+    fn bittensor_account() -> AccountInfoU64 {
+        AccountInfoU64 {
+            nonce: 1981,
+            consumers: 0,
+            providers: 1,
+            sufficients: 0,
+            data: AccountDataU64 {
+                free: 75_057_346,
+                reserved: 0,
+                frozen: 0,
+                flags: 1 << 127,
+            },
+        }
+    }
+
+    #[test]
+    fn u64_balance_account_matches_no_fixed_layout() {
+        let bytes = bittensor_account().encode();
+        assert_eq!(bytes.len(), 56);
+        assert!(decode_account_info(&bytes).is_none());
+    }
+
+    #[test]
+    fn u64_balance_account_decodes_with_metadata() {
+        let data = decode_with_metadata(&bittensor_account()).expect("should decode");
+        assert_eq!(data.nonce, 1981);
+        assert_eq!(data.free, 75_057_346);
+        assert_eq!(data.reserved, 0);
+        assert_eq!(data.frozen, Some(0));
+        assert_eq!(data.misc_frozen, None);
+        assert_eq!(data.fee_frozen, None);
+    }
+
+    #[test]
+    fn u64_balance_amounts_are_not_mixed_up() {
+        let mut account = bittensor_account();
+        account.data.reserved = 1_000;
+        account.data.frozen = 57_346;
+
+        let data = decode_with_metadata(&account).expect("should decode");
+        assert_eq!(data.free, 75_057_346);
+        assert_eq!(data.reserved, 1_000);
+        assert_eq!(data.frozen, Some(57_346));
+    }
+
+    #[test]
+    fn newtype_balance_decodes_with_metadata() {
+        let account = AccountInfoWrapped {
+            nonce: 7,
+            data: AccountDataWrapped {
+                free: WrappedBalance(500),
+                reserved: WrappedBalance(20),
+                frozen: WrappedBalance(3),
+            },
+        };
+
+        let data = decode_with_metadata(&account).expect("should decode");
+        assert_eq!(data.nonce, 7);
+        assert_eq!(data.free, 500);
+        assert_eq!(data.reserved, 20);
+        assert_eq!(data.frozen, Some(3));
+    }
+
+    #[test]
+    fn legacy_frozen_fields_decode_with_metadata() {
+        let account = AccountInfoLegacyU64 {
+            nonce: 2,
+            data: AccountDataLegacyU64 {
+                free: 900,
+                reserved: 10,
+                misc_frozen: 40,
+                fee_frozen: 30,
+            },
+        };
+
+        let data = decode_with_metadata(&account).expect("should decode");
+        assert_eq!(data.free, 900);
+        assert_eq!(data.frozen, None);
+        assert_eq!(data.misc_frozen, Some(40));
+        assert_eq!(data.fee_frozen, Some(30));
+    }
+
+    /// `Balances::Locks` of a chain whose `Balance` is u64: 17 bytes per lock, against 25.
+    #[test]
+    fn u64_balance_locks_decode_with_metadata() {
+        use scale_decode::DecodeAsType;
+
+        #[derive(Encode, scale_info::TypeInfo)]
+        struct LockU64 {
+            id: [u8; 8],
+            amount: u64,
+            reasons: ReasonsU64,
+        }
+
+        #[derive(Encode, scale_info::TypeInfo)]
+        #[allow(dead_code)]
+        enum ReasonsU64 {
+            Fee,
+            Misc,
+            All,
+        }
+
+        let locks = vec![
+            LockU64 {
+                id: *b"staking ",
+                amount: 1_000,
+                reasons: ReasonsU64::All,
+            },
+            LockU64 {
+                id: *b"vesting ",
+                amount: 57_346,
+                reasons: ReasonsU64::Misc,
+            },
+        ];
+        let bytes = locks.encode();
+        assert!(decode_balance_locks(&bytes).is_none());
+
+        let mut registry = scale_info::Registry::new();
+        let type_id = registry
+            .register_type(&scale_info::meta_type::<Vec<LockU64>>())
+            .id;
+        let registry: PortableRegistry = registry.into();
+
+        let decoded = Vec::<BalanceLock>::decode_as_type(&mut &bytes[..], type_id, &registry)
+            .map(into_decoded_locks)
+            .expect("should decode");
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].id, format!("0x{}", hex::encode(b"staking ")));
+        assert_eq!(decoded[0].amount, 1_000);
+        assert_eq!(decoded[0].reasons, "All");
+        assert_eq!(decoded[1].amount, 57_346);
+        assert_eq!(decoded[1].reasons, "Misc");
+    }
+
+    /// `Proxy::Proxies` of a chain with a u64 deposit and its own proxy types, as on Bittensor.
+    #[test]
+    fn u64_deposit_proxies_decode_with_metadata() {
+        use scale_decode::DecodeAsType;
+
+        #[derive(Encode, scale_info::TypeInfo)]
+        struct ProxyU64 {
+            delegate: [u8; 32],
+            proxy_type: ChainProxyType,
+            delay: u32,
+        }
+
+        #[derive(Encode, scale_info::TypeInfo)]
+        #[allow(dead_code)]
+        enum ChainProxyType {
+            Any,
+            Owner,
+            ChildKeys,
+        }
+
+        let stored = (
+            vec![ProxyU64 {
+                delegate: [7u8; 32],
+                proxy_type: ChainProxyType::ChildKeys,
+                delay: 5,
+            }],
+            93_000u64,
+        );
+        let bytes = stored.encode();
+        assert!(decode_proxy_definitions(&bytes, 42).is_none());
+
+        let mut registry = scale_info::Registry::new();
+        let type_id = registry
+            .register_type(&scale_info::meta_type::<(Vec<ProxyU64>, u64)>())
+            .id;
+        let registry: PortableRegistry = registry.into();
+
+        let (proxies, deposit) = <(Vec<ProxyDefinitionNamed>, u128)>::decode_as_type(
+            &mut &bytes[..],
+            type_id,
+            &registry,
+        )
+        .expect("should decode");
+        assert_eq!(deposit, 93_000);
+        assert_eq!(proxies.len(), 1);
+        assert_eq!(proxies[0].delegate, [7u8; 32]);
+        assert_eq!(proxies[0].delay, 5);
+        assert_eq!(
+            variant_name(&proxies[0].proxy_type).as_deref(),
+            Some("ChildKeys")
+        );
+    }
+
+    #[test]
+    fn value_without_balances_is_rejected() {
+        #[derive(Encode, scale_info::TypeInfo)]
+        struct NotAnAccount {
+            nonce: u32,
+            data: u64,
+        }
+
+        assert!(decode_with_metadata(&NotAnAccount { nonce: 1, data: 2 }).is_none());
     }
 }
 

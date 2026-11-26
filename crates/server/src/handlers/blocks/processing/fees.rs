@@ -11,7 +11,7 @@
 
 use crate::state::AppState;
 use crate::utils::{self, decode_runtime_dispatch_info};
-use parity_scale_codec::{Decode, Encode};
+use parity_scale_codec::{DecodeAll, Encode};
 use serde_json::Value;
 use subxt::SubstrateConfig;
 use subxt::client::OnlineClientAtBlock;
@@ -67,8 +67,21 @@ fn decode_fee_details(bytes: &[u8]) -> Option<Value> {
         return None;
     }
 
-    let (inclusion_fee, _tip): (Option<(u128, u128, u128)>, u128) =
-        Decode::decode(&mut &bytes[..]).ok()?;
+    let inclusion_fee = match <(Option<(u128, u128, u128)>, u128)>::decode_all(&mut &bytes[..]) {
+        Ok((inclusion_fee, _tip)) => inclusion_fee,
+        // A chain with a u64 `Balance` (e.g. Bittensor) encodes every amount on 8 bytes.
+        Err(_) => {
+            let (inclusion_fee, _tip) =
+                <(Option<(u64, u64, u64)>, u64)>::decode_all(&mut &bytes[..]).ok()?;
+            inclusion_fee.map(|(base_fee, len_fee, adjusted_weight_fee)| {
+                (
+                    u128::from(base_fee),
+                    u128::from(len_fee),
+                    u128::from(adjusted_weight_fee),
+                )
+            })
+        }
+    };
 
     let inclusion_fee_json = inclusion_fee.map(|(base_fee, len_fee, adjusted_weight_fee)| {
         serde_json::json!({
@@ -205,4 +218,49 @@ pub async fn extract_fee_info_for_extrinsic(
     }
 
     serde_json::Map::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fee_details_with_u128_balance() {
+        let bytes = (Some((100u128, 50u128, 1_000u128)), 0u128).encode();
+
+        let details = decode_fee_details(&bytes).expect("should decode");
+        assert_eq!(details["inclusionFee"]["baseFee"], "100");
+        assert_eq!(details["inclusionFee"]["lenFee"], "50");
+        assert_eq!(details["inclusionFee"]["adjustedWeightFee"], "1000");
+    }
+
+    #[test]
+    fn fee_details_with_u64_balance() {
+        let bytes = (Some((100u64, 50u64, 1_000u64)), 0u64).encode();
+        assert_eq!(bytes.len(), 33);
+
+        let details = decode_fee_details(&bytes).expect("should decode");
+        assert_eq!(details["inclusionFee"]["baseFee"], "100");
+        assert_eq!(details["inclusionFee"]["lenFee"], "50");
+        assert_eq!(details["inclusionFee"]["adjustedWeightFee"], "1000");
+    }
+
+    #[test]
+    fn fee_details_without_inclusion_fee_with_u64_balance() {
+        let bytes = (None::<(u64, u64, u64)>, 0u64).encode();
+
+        let details = decode_fee_details(&bytes).expect("should decode");
+        assert!(details["inclusionFee"].is_null());
+    }
+
+    #[test]
+    fn fee_details_with_trailing_bytes_is_rejected() {
+        let mut bytes = (Some((100u64, 50u64, 1_000u64)), 0u64).encode();
+        bytes.push(0);
+        assert!(decode_fee_details(&bytes).is_none());
+
+        let mut bytes = (Some((100u128, 50u128, 1_000u128)), 0u128).encode();
+        bytes.push(0);
+        assert!(decode_fee_details(&bytes).is_none());
+    }
 }
